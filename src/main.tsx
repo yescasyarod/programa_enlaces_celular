@@ -555,7 +555,7 @@ const BlockColumn = forwardRef<BlockColumnHandle, BlockColumnProps>(function Blo
   const wsTimersRef = useRef<Record<number, ReturnType<typeof setTimeout> | undefined>>({});
   const composingRef = useRef<Record<number, boolean>>({});
 
-  // 🔒 Shadow local por bloque (para evitar parpadeos tras escribir)
+  // 🔒 Shadow local por bloque (para evitar parpadeos tras escribir).
   const shadowRef = useRef<Record<number, { text: string; until: number }>>({});
   const focusedIdRef = useRef<number | null>(null);
   const idleExtendTimersRef = useRef<Record<number, ReturnType<typeof setTimeout> | undefined>>({});
