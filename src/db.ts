@@ -107,14 +107,7 @@ export async function getDb(): Promise<Database> {
   // Índices
   await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_guid ON folders(guid);");
   await db.execute("CREATE INDEX IF NOT EXISTS idx_folders_parent_del_name ON folders(COALESCE(parent_id,0),deleted,name COLLATE NOCASE);");
-
-  // 🔐 Unicidad de guid de blocks SOLO cuando no es NULL (SQLite permite múltiples NULLs).
-  // (Si ya existía un idx UNIQUE simple, este 'partial' convivirá sin romper nada.)
-  await db.execute(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_guid_unique
-    ON blocks(guid)
-    WHERE guid IS NOT NULL;
-  `);
+  await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_guid ON blocks(guid);");
   await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_folder_del ON blocks(folder_id,deleted);");
   await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_folder_del_pos ON blocks(folder_id,deleted,position);");
 
@@ -460,9 +453,8 @@ async function blockIdByGuid(guid: string): Promise<number | null> {
  * Si `forcedGuid` existe ya, devuelve ese bloque (idempotente) y NO inserta.
  * `link_url` es opcional (para cuando el servidor crea/mueve con link inicial).
  *
- * 🔧 Cambios:
- *  - Transacciones en “abrir hueco + insertar” y en “revivir borrado”.
- *  - Idempotencia por GUID (ya la tenías) + índice único parcial a nivel de DB.
+ * 🔧 Cambios: si existe el GUID con deleted=1, “resucita” la fila en la nueva carpeta
+ * y/o posición para evitar UNIQUE 2067.
  */
 export async function createBlock(
   folderId: number,
@@ -495,40 +487,32 @@ export async function createBlock(
       };
     }
 
-    // ♻️ estaba borrado → resucitar (posible apertura de hueco)
-    await d.execute("BEGIN");
-    try {
-      let pos = position ?? null;
-      if (pos == null) {
-        const r = await d.select<{ m: number }[]>(
-          "SELECT COALESCE(MAX(position),0) AS m FROM blocks WHERE folder_id=? AND deleted=0",
-          [folderId]
-        );
-        pos = (r[0]?.m ?? 0) + 1;
-      } else {
-        await d.execute(
-          "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND deleted=0",
-          [folderId, pos]
-        );
-      }
-
-      await d.execute(
-        `UPDATE blocks
-           SET folder_id=?,
-               position=?,
-               text=?,
-               link_url=?,
-               updated_at=?,
-               deleted=0
-         WHERE id=?`,
-        [folderId, pos, text ?? "", link_url ?? null, ts, e.id]
+    // ♻️ estaba borrado → resucitar
+    let pos = position ?? null;
+    if (pos == null) {
+      const r = await d.select<{ m: number }[]>(
+        "SELECT COALESCE(MAX(position),0) AS m FROM blocks WHERE folder_id=? AND deleted=0",
+        [folderId]
       );
-
-      await d.execute("COMMIT");
-    } catch (err) {
-      await d.execute("ROLLBACK");
-      throw err;
+      pos = (r[0]?.m ?? 0) + 1;
+    } else {
+      await d.execute(
+        "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND deleted=0",
+        [folderId, pos]
+      );
     }
+
+    await d.execute(
+      `UPDATE blocks
+         SET folder_id=?,
+             position=?,
+             text=?,
+             link_url=?,
+             updated_at=?,
+             deleted=0
+       WHERE id=?`,
+      [folderId, pos, text ?? "", link_url ?? null, ts, e.id]
+    );
 
     const row = await d.select<BlockRow[]>(
       "SELECT id, folder_id, position, text, link_url, guid, updated_at, deleted FROM blocks WHERE id=?",
@@ -545,41 +529,24 @@ export async function createBlock(
   }
 
   // ➕ inserción normal (no existía)
-  if (position == null) {
-    // sin “abrir hueco”: insert al final (no hace falta transacción)
+  let pos = position ?? null;
+  if (pos == null) {
     const r = await d.select<{ m: number }[]>(
       "SELECT COALESCE(MAX(position),0) AS m FROM blocks WHERE folder_id=? AND deleted=0",
       [folderId]
     );
-    const pos = (r[0]?.m ?? 0) + 1;
-
-    await d.execute(
-      "INSERT INTO blocks(folder_id,position,text,link_url,guid,updated_at,deleted) VALUES(?,?,?,?,?,?,0)",
-      [folderId, pos, text ?? "", link_url ?? null, guid, ts]
-    );
+    pos = (r[0]?.m ?? 0) + 1;
   } else {
-    // abrir hueco + insertar → transacción
-    await d.execute("BEGIN");
-    try {
-      await d.execute(
-        "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND deleted=0",
-        [folderId, position]
-      );
-      // doble-check por si otra ruta ya insertó este GUID
-      const dupe = await d.select<{ id: number }[]>("SELECT id FROM blocks WHERE guid=? LIMIT 1", [guid]);
-      if (!dupe.length) {
-        await d.execute(
-          "INSERT INTO blocks(folder_id,position,text,link_url,guid,updated_at,deleted) VALUES(?,?,?,?,?,?,0)",
-          [folderId, position, text ?? "", link_url ?? null, guid, ts]
-        );
-      }
-      await d.execute("COMMIT");
-    } catch (err) {
-      await d.execute("ROLLBACK");
-      throw err;
-    }
+    await d.execute(
+      "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND deleted=0",
+      [folderId, pos]
+    );
   }
 
+  await d.execute(
+    "INSERT INTO blocks(folder_id,position,text,link_url,guid,updated_at,deleted) VALUES(?,?,?,?,?,?,0)",
+    [folderId, pos, text ?? "", link_url ?? null, guid, ts]
+  );
   const row = await d.select<BlockRow[]>(
     "SELECT id, folder_id, position, text, link_url, guid, updated_at, deleted FROM blocks WHERE guid=? LIMIT 1",
     [guid]
@@ -627,19 +594,11 @@ export async function deleteBlock(id: number): Promise<void> {
   const folderId = r[0].folder_id;
   const pos = r[0].position;
 
-  // 🔒 borrar + compactar en transacción
-  await d.execute("BEGIN");
-  try {
-    await d.execute("UPDATE blocks SET deleted=1, updated_at=? WHERE id=?", [nowIso(), id]);
-    await d.execute(
-      "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND deleted=0",
-      [folderId, pos]
-    );
-    await d.execute("COMMIT");
-  } catch (err) {
-    await d.execute("ROLLBACK");
-    throw err;
-  }
+  await d.execute("UPDATE blocks SET deleted=1, updated_at=? WHERE id=?", [nowIso(), id]);
+  await d.execute(
+    "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND deleted=0",
+    [folderId, pos]
+  );
 }
 export const dbDeleteBlock = deleteBlock;
 
@@ -657,25 +616,17 @@ export async function moveBlock(id: number, newPosition: number): Promise<void> 
   const total = await blocksCount(folderId);
   const dest = Math.max(1, Math.min(total, newPosition));
 
-  // 🔒 todo el reorden en transacción
-  await d.execute("BEGIN");
-  try {
-    if (dest < oldPos) {
-      await d.execute(
-        "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND position<? AND deleted=0",
-        [folderId, dest, oldPos]
-      );
-    } else {
-      await d.execute(
-        "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND position<=? AND deleted=0",
-        [folderId, oldPos, dest]
-      );
-    }
-    await d.execute("UPDATE blocks SET position=?, updated_at=? WHERE id=?", [dest, nowIso(), id]);
-    await d.execute("COMMIT");
-  } catch (err) {
-    await d.execute("ROLLBACK");
-    throw err;
+  if (dest < oldPos) {
+    await d.execute(
+      "UPDATE blocks SET position=position+1 WHERE folder_id=? AND position>=? AND position<? AND deleted=0",
+      [folderId, dest, oldPos]
+    );
+  } else {
+    await d.execute(
+      "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND position<=? AND deleted=0",
+      [folderId, oldPos, dest]
+    );
   }
+  await d.execute("UPDATE blocks SET position=?, updated_at=? WHERE id=?", [dest, nowIso(), id]);
 }
 export const dbMoveBlock = moveBlock;

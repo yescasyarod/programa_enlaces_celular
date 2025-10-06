@@ -23,6 +23,7 @@ import {
   deleteFolder as dbDeleteFolder,
   listBlocks,
   ensureAtLeastOneBlock,
+  createBlock as dbCreateBlock,
   editBlock as dbEditBlock,
   deleteBlock as dbDeleteBlock,
   moveBlock as dbMoveBlock,
@@ -72,57 +73,48 @@ async function openExternalLink(raw: string) {
   }
 
 
-  async function dbMoveBlockToFolderEndByGuids(blockGuid: string, destFolderGuid: string) {
-    const b = await blockByGuid(blockGuid);
-    if (!b) return;
-    const d = await getDb();
-  
-    const destFolderId = await folderIdByGuid(destFolderGuid);
-    if (destFolderId == null) return;
-  
-    // Inserción: después del último NO vacío (antes del centinela)
-    const lastNon = await d.select<{ pos: number }[]>(
-      "SELECT position AS pos FROM blocks WHERE folder_id=? AND deleted=0 AND TRIM(IFNULL(text,''))<>'' ORDER BY position DESC LIMIT 1",
-      [destFolderId]
+async function dbMoveBlockToFolderEndByGuids(blockGuid: string, destFolderGuid: string) {
+  const b = await blockByGuid(blockGuid);
+  if (!b) return;
+  const d = await getDb();
+
+  const destFolderId = await folderIdByGuid(destFolderGuid);
+  if (destFolderId == null) return;
+
+  // Inserción: después del último NO vacío (antes del centinela)
+  const lastNon = await d.select<{ pos: number }[]>(
+    "SELECT position AS pos FROM blocks WHERE folder_id=? AND deleted=0 AND TRIM(IFNULL(text,''))<>'' ORDER BY position DESC LIMIT 1",
+    [destFolderId]
+  );
+  const insertPos = lastNon.length ? lastNon[0].pos + 1 : 1;
+
+  // Abrir hueco en destino
+  await d.execute(
+    "UPDATE blocks SET position=position+1 WHERE folder_id=? AND deleted=0 AND position>=?",
+    [destFolderId, insertPos]
+  );
+
+  // Compactar origen si cambia de carpeta
+  const srcFolderIdRow = await d.select<{ fid: number; pos: number }[]>(
+    "SELECT folder_id AS fid, position AS pos FROM blocks WHERE id=?",
+    [b.id]
+  );
+  const srcFid = srcFolderIdRow[0]?.fid;
+  const srcPos = srcFolderIdRow[0]?.pos;
+  if (srcFid != null && srcFid !== destFolderId && srcPos != null) {
+    await d.execute(
+      "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND deleted=0",
+      [srcFid, srcPos]
     );
-    const insertPos = lastNon.length ? lastNon[0].pos + 1 : 1;
-  
-    await d.execute("BEGIN"); // PATCH
-    try {
-      // Abrir hueco en destino
-      await d.execute(
-        "UPDATE blocks SET position=position+1 WHERE folder_id=? AND deleted=0 AND position>=?",
-        [destFolderId, insertPos]
-      );
-  
-      // Compactar origen si cambia de carpeta
-      const srcFolderIdRow = await d.select<{ fid: number; pos: number }[]>(
-        "SELECT folder_id AS fid, position AS pos FROM blocks WHERE id=?",
-        [b.id]
-      );
-      const srcFid = srcFolderIdRow[0]?.fid;
-      const srcPos = srcFolderIdRow[0]?.pos;
-      if (srcFid != null && srcFid !== destFolderId && srcPos != null) {
-        await d.execute(
-          "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND deleted=0",
-          [srcFid, srcPos]
-        );
-      }
-  
-      // Mover el bloque
-      await d.execute("UPDATE blocks SET folder_id=?, position=? WHERE id=?", [
-        destFolderId,
-        insertPos,
-        b.id,
-      ]);
-  
-      await d.execute("COMMIT");
-    } catch (e) {
-      await d.execute("ROLLBACK");
-      throw e;
-    }
   }
-  
+
+  // Mover el bloque
+  await d.execute("UPDATE blocks SET folder_id=?, position=? WHERE id=?", [
+    destFolderId,
+    insertPos,
+    b.id,
+  ]);
+}
 
 /* =========================
    WS + Sync bus
@@ -262,7 +254,7 @@ async function ensureWs(): Promise<WebSocket | null> {
       }
       if (msg?.type !== "event") return;
 
-      // ⤵️ tu lógica existente de aplicación de eventos
+      // ⤵️ tu lógica existente de aplicación de eventos (SIN cambios)
       const eid = Number(msg.event_id || 0);
       if (eid > 0) setLastEventId(eid);
 
@@ -279,130 +271,41 @@ async function ensureWs(): Promise<WebSocket | null> {
               await dbEditBlock(b.id, p.text ?? "");
             }
           } else {
-            // ⤵️ CONVERTIR EL CENTINELA EN EL BLOQUE REAL (en lugar de crear uno nuevo)
             const fid = p.folder_guid
               ? await folderIdByGuid(p.folder_guid)
               : await folderIdByGuid((await getRoot()).guid);
-
             if (fid != null) {
-              const d = await getDb();
-              // último bloque de la carpeta
-              const tail = await d.select<{ id: number; text: string | null }[]>(
-                "SELECT id, text FROM blocks WHERE folder_id=? AND deleted=0 ORDER BY position DESC LIMIT 1",
-                [fid]
-              );
-              const lastIsEmpty = tail.length > 0 && (tail[0].text ?? "").trim() === "";
-              const nowIso = new Date().toISOString();
-              const linkArg = (((p.url ?? p.link) ?? "") as string).trim() || null;
-
-              if (lastIsEmpty) {
-                // convierte centinela -> bloque real con el GUID remoto
-                await d.execute(
-                  "UPDATE blocks SET text=?, guid=?, link_url=?, updated_at=? WHERE id=?",
-                  [p.text ?? "", p.block_guid, linkArg, nowIso, tail[0].id]
-                );
-              } else {
-                // (raro) no hay centinela: insertar ANTES del centinela lógico
-                // = después del último NO vacío (transaccionado)
-                const lastNon = await d.select<{ pos: number }[]>(
-                  "SELECT position AS pos FROM blocks WHERE folder_id=? AND deleted=0 AND TRIM(IFNULL(text,''))<>'' ORDER BY position DESC LIMIT 1",
-                  [fid]
-                );
-                const insertPos = lastNon.length ? lastNon[0].pos + 1 : 1;
-
-                await d.execute("BEGIN");
-                try {
-                  // Double-check idempotencia por si otra ruta ya materializó el GUID
-                  const dupe = await blockByGuid(p.block_guid);
-                  if (!dupe) {
-                    await d.execute(
-                      "UPDATE blocks SET position=position+1 WHERE folder_id=? AND deleted=0 AND position>=?",
-                      [fid, insertPos]
-                    );
-                    await d.execute(
-                      "INSERT INTO blocks(folder_id, position, text, guid, link_url, updated_at, deleted) VALUES(?,?,?,?,?,?,0)",
-                      [fid, insertPos, p.text ?? "", p.block_guid, linkArg, nowIso]
-                    );
-                  }
-                  await d.execute("COMMIT");
-                } catch (e) {
-                  await d.execute("ROLLBACK");
-                  throw e;
-                }
-              } // fin if (lastIsEmpty)
-            } // fin if (fid != null)
-          } // fin else (!b)
-          emitSync();
-          return;
-        } else if (inner === "create_block") {
-          const already = await blockByGuid(p.block_guid);
-          if (already) {
-            // solo actualizar texto/enlace si llegó algo
-            const d = await getDb();
-            const nowIso = new Date().toISOString();
-            await d.execute(
-              "UPDATE blocks SET text=?, link_url=?, updated_at=? WHERE id=?",
-              [p.text ?? "", (((p.url ?? p.link) ?? "") as string).trim() || null, nowIso, already.id]
-            );
-            emitSync();
-            return;
+              await dbCreateBlock(fid, p.text ?? "", null, p.block_guid);
+            }
           }
-
+        } else if (inner === "create_block") {
           const fid = p.folder_guid
             ? await folderIdByGuid(p.folder_guid)
             : await folderIdByGuid((await getRoot()).guid);
-
+        
           if (fid != null) {
             const isSentinel = !((p.text ?? "").trim());
-            const d = await getDb();
-            const nowIso = new Date().toISOString();
-            const linkArg = (((p.url ?? p.link) ?? "") as string).trim() || null;
-
+            // normaliza link: preferimos p.url, luego p.link; "" → null
+            const normLink = (((p.url ?? p.link) ?? "") as string).trim();
+            const linkArg = normLink || null;
+        
             if (isSentinel) {
+              // Sólo crear centinela si no hay uno vacío al final
+              const d = await getDb();
               const tail = await d.select<{ id: number; text: string }[]>(
                 "SELECT id, text FROM blocks WHERE folder_id=? AND deleted=0 ORDER BY position DESC LIMIT 1",
                 [fid]
               );
               const alreadyEmptyAtEnd = tail.length > 0 && (tail[0].text ?? "").trim() === "";
               if (!alreadyEmptyAtEnd) {
-                await d.execute(
-                  "INSERT INTO blocks(folder_id, position, text, guid, link_url, updated_at, deleted) " +
-                    "SELECT ?, COALESCE(MAX(position),0)+1, '', ?, NULL, ?, 0 FROM blocks WHERE folder_id=?",
-                  [fid, p.block_guid, nowIso, fid]
-                );
+                // centinela sin enlace
+                await dbCreateBlock(fid, "", null, p.block_guid, null);
               }
             } else {
-              // insertar ANTES del centinela = después del último NO vacío (transaccionado)
-              const lastNon = await d.select<{ pos: number }[]>(
-                "SELECT position AS pos FROM blocks WHERE folder_id=? AND deleted=0 AND TRIM(IFNULL(text,''))<>'' ORDER BY position DESC LIMIT 1",
-                [fid]
-              );
-              const insertPos = lastNon.length ? lastNon[0].pos + 1 : 1;
-
-              await d.execute("BEGIN");
-              try {
-                // Double-check idempotencia por GUID antes de insertar
-                const dupe = await blockByGuid(p.block_guid);
-                if (!dupe) {
-                  await d.execute(
-                    "UPDATE blocks SET position=position+1 WHERE folder_id=? AND deleted=0 AND position>=?",
-                    [fid, insertPos]
-                  );
-                  await d.execute(
-                    "INSERT INTO blocks(folder_id, position, text, guid, link_url, updated_at, deleted) VALUES(?,?,?,?,?,?,0)",
-                    [fid, insertPos, p.text ?? "", p.block_guid, linkArg, nowIso]
-                  );
-                }
-                await d.execute("COMMIT");
-              } catch (e) {
-                await d.execute("ROLLBACK");
-                throw e;
-              }
-            } // fin else (no sentinela)
-          } // fin if (fid != null)
-
-          emitSync();
-          return;
+              // bloque normal: pasa también el enlace si vino
+              await dbCreateBlock(fid, p.text ?? "", null, p.block_guid, linkArg);
+            }
+          }
         } else if (inner === "delete_block") {
           const b = await blockByGuid(p.block_guid);
           if (b) await dbDeleteBlock(b.id);
@@ -416,7 +319,10 @@ async function ensureWs(): Promise<WebSocket | null> {
               await dbMoveBlockToFolderEndByGuids(blockGuid, newFolderGuid);
             }
           }
-        } else if (inner === "move_block_to_folder" || (inner === "move_block" && p.new_folder_guid)) {
+        } else if (
+          inner === "move_block_to_folder" ||
+          (inner === "move_block" && p.new_folder_guid)
+        ) {
           const blockGuid: string = p.block_guid;
           const newFolderGuid: string = p.new_folder_guid;
           if (blockGuid && newFolderGuid) {
@@ -433,18 +339,18 @@ async function ensureWs(): Promise<WebSocket | null> {
           await deleteFolderByGuid(p.folder_guid);
         } else if (inner === "move_folder") {
           await moveFolderByGuids(p.folder_guid, p.new_parent_guid);
-        } else if (inner === "set_block_link") {
+        }
+        else if (inner === "set_block_link") {
           const b = await blockByGuid(p.block_guid);
           if (b) {
             const d = await getDb();
             const val = ((p.url ?? p.link) ?? "").trim();
-            await d.execute("UPDATE blocks SET link_url=?, updated_at=? WHERE id=?", [
-              val || null,
-              new Date().toISOString(),
-              b.id,
-            ]);
+            await d.execute(
+              "UPDATE blocks SET link_url=?, updated_at=? WHERE id=?",
+              [ val || null, new Date().toISOString(), b.id ]
+            );
           }
-        }
+        }        
       } catch (e) {
         console.error("[WS] apply error:", e, inner, p);
       }
@@ -460,7 +366,6 @@ async function ensureWs(): Promise<WebSocket | null> {
   }
   return ws;
 }
-
 
 
 async function wsEmit(obj: any): Promise<void> {
@@ -555,7 +460,7 @@ const BlockColumn = forwardRef<BlockColumnHandle, BlockColumnProps>(function Blo
   const wsTimersRef = useRef<Record<number, ReturnType<typeof setTimeout> | undefined>>({});
   const composingRef = useRef<Record<number, boolean>>({});
 
-  // 🔒 Shadow local por bloque (para evitar parpadeos tras escribir).
+  // 🔒 Shadow local por bloque (para evitar parpadeos tras escribir)
   const shadowRef = useRef<Record<number, { text: string; until: number }>>({});
   const focusedIdRef = useRef<number | null>(null);
   const idleExtendTimersRef = useRef<Record<number, ReturnType<typeof setTimeout> | undefined>>({});
