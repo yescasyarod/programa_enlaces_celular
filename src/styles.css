@@ -1,0 +1,570 @@
+/* ===== reset global ===== */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* ===== globals ===== */
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  background-color: #f6f6f6;
+  color: #0f0f0f;
+  --brand-blue: #396cd8; /* mismo azul del botón de categorías */
+
+  /* Safe-area iOS */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* ⭐ NUEVO: altura del teclado cuando el navegador lo exponga (iOS 16+). Fallback a 0. */
+  --kb-safe: env(keyboard-inset-height, 0px);
+}
+
+a { color: inherit; text-decoration: none; }
+
+input, button, textarea {
+  font-family: inherit;
+}
+input, button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  background: #fff;
+  box-shadow: 0 2px 2px rgba(0,0,0,0.2);
+}
+button { cursor: pointer; }
+button:hover { border-color: #396cd8 }
+button:active { background: #e8e8e8 }
+
+/* ===== desktop layout ===== */
+.app-container {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+.folder-panel { flex: 0 0 25%; }
+.block-panel  { flex: 1; }
+.control-panel{ flex: 0 0 20%; }
+
+/* ===== BlockColumn ===== */
+.blocks-list {
+  flex: 1 1 auto;
+  min-height: 0;                     /* CLAVE para permitir scroll dentro de flex */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch; /* suaviza scroll en iOS */
+  padding-right: 8px;
+  box-sizing: border-box;
+
+  /* ⭐ NUEVO: evita “tirones” y permite reservar espacio para el foco */
+  overscroll-behavior: contain;
+  scroll-padding-bottom: 120px; /* espacio para que el foco no quede pegado al borde */
+}
+.block-item {
+  display: flex;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.block-index {
+  width: 30px;
+  flex-shrink: 0;
+}
+.block-textarea {
+  flex: 1;
+  resize: none;
+  overflow: hidden;
+  padding: 4px;
+  margin-right: 4px;
+  box-sizing: border-box;
+  border-radius: 10px;
+  /* ⭐ NUEVO: cuando el .tsx llama scrollIntoView, deja margen inferior visible */
+  scroll-margin-bottom: 120px;
+}
+.block-delete { flex-shrink: 0; }
+.blocks-pagination {
+  display: flex;
+  align-items: center;
+  margin-top: 0px;
+  margin-bottom: 0px;
+  padding-bottom: 0px;
+  gap: 4px;
+  flex: 0 0 auto; /* no crece */
+}
+.page-input { box-sizing: border-box; }
+.blocks-pagination button { flex: none; }
+
+/* ⭐ NUEVO: rail derecha para el botón de borrar */
+.block-right-rail {
+  display: flex;
+  gap: 6px;
+}
+/* Botón de borrar más pequeño y bien centrado */
+.block-delete {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 8px;
+}
+
+/* ===== FolderTreePanel ===== */
+.folder-tree-panel { display: flex; flex-direction: column; height: 100%; }
+.folder-search {
+  width: 100%;
+  padding: 8px;
+  margin-bottom: 8px;
+  box-sizing: border-box;
+}
+.tree-container {
+  flex: 1;
+  overflow-y: auto;
+  background: #fff;
+  padding: 8px;
+  box-sizing: border-box;
+}
+.folder-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+.folder-buttons button { flex: 1; padding: 8px; }
+
+.folder-node {}
+.folder-node-header { display: flex; align-items: center; gap: 6px; }
+.folder-node-toggle { cursor: pointer; user-select: none; }
+.folder-node-indent { display: inline-block; width: 1em; }
+.folder-node-label { cursor: pointer; }
+.folder-node-label.selected { font-weight: 700; }
+.folder-node-children { padding-left: 12px; }
+
+/* ===== RightPanel ===== */
+.control-panel label {
+  display: block;
+  margin-top: 12px;
+  margin-bottom: 4px;
+}
+.control-panel input[type="text"],
+.control-panel input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+}
+.move-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+.move-buttons button { flex: 1; }
+
+/* ===== Overlay (mobile categories) ===== */
+.mobile-overlay {
+  position: fixed;
+  inset: 0;
+  background: #fff;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 12px;
+  box-sizing: border-box;
+  overflow: auto;
+
+  padding-top: max(var(--safe-top, 0px), 80px);
+  padding-bottom: max(var(--safe-bottom, 0px), 80px);
+}
+/* Sobrescribe tu .overlay-close */
+.overlay-close {
+  display: block;
+  box-sizing: border-box;
+
+  /* NO crecer en el eje vertical (columna) */
+  flex: 0 0 auto;       /* clave para que no se estire en alto */
+  align-self: auto;     /* o quita cualquier align-self previo */
+
+  /* Estilo azul como categorías */
+  background: var(--brand-blue, #396cd8);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+
+  padding: 0px 0px;
+  font-size: 40px;      /* ajusta a gusto */
+  line-height: 1;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: 0 2px 2px rgba(0,0,0,0.12);
+  margin-top: 0px;
+  margin-bottom: 5px;
+  margin-left: 8px;
+  margin-right: 8px;
+}
+
+.overlay-close:hover { border-color: #396cd8 }
+.overlay-close:active { opacity: .92; }
+
+.overlay-tree {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px;
+  box-sizing: border-box;
+  margin-top: 0px;
+  margin-bottom: 0px;
+}
+.overlay-name-input {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+}
+.overlay-name-input input { flex: 1; }
+.overlay-buttons {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  gap: 8px;
+  margin-bottom: 0;
+}
+.overlay-buttons button {
+  flex: 1;
+  margin: 0 4px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  background: #fff;
+}
+
+/* ===== mobile layout ===== */
+@media (max-width: 600px) {
+  /* App móvil ocupa el viewport (el scroll vive dentro de la zona de bloques) */
+  .app-container.mobile {
+    display: flex;
+    flex-direction: column;
+
+    /* ⭐ NUEVO: usar dvh cuando esté disponible para no saltar con la barra/teclado */
+    height: 100vh;
+    height: 100dvh;
+
+    overflow: hidden; /* evita doble scroll global */
+    padding: 0 12px;
+    box-sizing: border-box;
+
+    /* respeta notch/barra inferior y mantiene 8px mínimo */
+    
+
+    /* ⭐ NUEVO: deja espacio inferior adicional por teclado si el navegador lo expone */
+    padding-bottom: calc(max(var(--safe-bottom), 100px) + var(--kb-safe));
+  }
+
+  .mobile-blocks-list .blocks-list {
+    max-height: 100vh;   /* ajusta: 40vh, 60vh según prefieras */
+    max-height: 100dvh;  /* ⭐ NUEVO: dvh para estabilidad en iOS */
+    overflow-y: auto;
+
+    /* ⭐ NUEVO: reserva más fondo para que el enfoque no quede tapado */
+    scroll-padding-bottom: calc(140px + var(--kb-safe));
+  }
+
+  .folder-panel,
+  .block-panel,
+  .control-panel {
+    flex: none;
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    outline: none;
+  }
+
+  .folder-panel { padding: 12px; }
+  .folder-panel input { margin-bottom: 12px; }
+  .folder-panel .tree-container { max-height: 200px; }
+
+  .block-panel { padding: 12px; }
+  /* Evita limitar la altura de la lista en móvil: el scroll real vive en .mobile-blocks-list */
+  /* .block-panel .blocks-list { max-height: 300px; }  <-- REMOVIDO PARA NO ROMPER EL SCROLL */
+  .block-panel .block-item { flex-direction: column; }
+  .block-panel .block-item > div { margin-bottom: 4px; }
+
+  .block-panel .block-item textarea { width: 100%; margin-right: 0; }
+
+  .control-panel { display: none; }
+
+  .mobile-header { padding-top: max(var(--safe-top), 8px); }
+  .mobile-categories-btn {
+    width: 100%;
+    padding: 12px;
+    font-size: 1em;
+    font-weight: bold;
+    background: #396cd8;
+    color: white;
+    border: none;
+  }
+  .mobile-cat-title {
+    text-align: center;
+    margin: 8px 0;
+    font-size: 1.2em;
+  }
+
+  /* La fila ocupa todo el ancho y puede repartir espacio */
+  .mobile-font-row {
+    display: flex;         /* en vez de inline-flex */
+    align-items: center;
+    gap: 8px;
+    padding: 8px 5px;
+    width: 100%;
+  }
+
+  /* Input de tamaño angosto */
+  .mobile-font-row input[type="number"] {
+    flex: 0 0 auto;
+    width: 6ch;
+    max-width: 6ch;
+    min-width: 0;
+  }
+
+  /* Bloque mover a la derecha que CRECE y toma el resto */
+  .mobile-font-row .mobile-move-row {
+    display: flex;
+    align-items: center;   /* (arregla el 'align-items: ri;') */
+    gap: 6px;
+    padding: 0;
+    margin-left: 8px;
+    flex: 1 1 auto;        /* << toma el resto del ancho */
+    min-width: 0;          /* permite que el input se encoja si hace falta */
+  }
+
+  /* Botones no crecen */
+  .mobile-font-row .mobile-move-row button {
+    flex: 0 0 auto;
+    padding: 8px;
+    border: 1px solid #ccc;
+    background: #fff;
+  }
+
+  /* El input intermedio (#) ocupa TODO el espacio disponible entre los botones */
+  .mobile-font-row .mobile-move-row .mobile-move-input {
+    flex: 1 1 auto;        /* << se expande */
+    min-width: 0;          /* evita overflow */
+    width: auto;
+    text-align: center;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-sizing: border-box;
+    margin: 0 4px;
+  }
+
+
+  .mobile-search-text {
+    box-sizing: border-box;
+    width: 100%;
+    margin: 8px 0;
+    padding: 8px 12px;             /* FIX de 'px 12px' */
+    border: 1px solid #ccc;
+  }
+
+  /* ⭐ Contenedor directo de BlockColumn en móvil */
+  .mobile-blocks-list {
+    display: flex;            /* CLAVE: padre flex para los 2 hijos de BlockColumn */
+    flex-direction: column;   /* lista arriba, paginación abajo */
+    flex: 1 1 auto;           /* ocupa el espacio restante del viewport */
+    min-height: 0;            /* permite que la lista interna pueda scrollear */
+    overflow: hidden;         /* el scroll vive en .blocks-list */
+    padding: 10px 0px;       /* FIX de '10 12px' */
+
+    /* ⭐ NUEVO: fondo extra si hay teclado, para que lo último escrito no quede tapado */
+    padding-bottom: calc(15px + var(--kb-safe));
+  }
+
+  /* ====== AJUSTE 2: bloque mover a la derecha del input ====== */
+  .mobile-move-row {
+    display: inline-flex;     /* inline para quedar a la derecha */
+    align-items: ri;
+    gap: 6px;
+    padding: 0;               /* sin padding para que no empuje */
+    margin-left: 8px;         /* espacio respecto al input de tamaño */
+    vertical-align: middle;
+    justify-content: flex-start;
+  }
+
+  .mobile-move-row button {
+    flex: none;
+    padding: 8px;
+    border: 1px solid #ccc;
+    background: white;
+  }
+
+  .mobile-move-row .mobile-move-input {
+    flex: 0 0 auto;           /* no se estira */
+    width: 6ch;               /* compacto; ajusta si quieres más/menos */
+    text-align: center;
+    padding: 8px;
+    min-width: 0;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-sizing: border-box;
+    margin: 0 4px;
+  }
+
+  /* ⭐ NUEVO: más margen para el scroll al enfocar textareas en móvil */
+  .block-textarea {
+    scroll-margin-bottom: calc(160px + var(--kb-safe));
+  }
+
+  /* ⭐ NUEVO: coloca el botón de borrar al borde derecho cuando los bloques se apilan en columna */
+  .block-right-rail {
+    align-self: flex-end;
+    margin-left: 0;
+  }
+  /* Quitar espacio entre Cambiar página y Reordenar */
+  .blocks-pagination {
+    margin-bottom: 0;
+    padding-bottom: 0;
+  }
+
+  .mobile-move-row {
+    margin-top: 0;      /* por si el .tsx le puso margen */
+    padding-top: 0;     /* ESTE era el que generaba el hueco */
+  }
+
+  /* Por si el contenedor los apila con gap */
+  .mobile-blocks-list {
+    gap: 0;
+  }
+
+}
+
+/* ===== Anti-zoom (móvil) ===== */
+@media (hover: none) and (pointer: coarse) {
+  .block-textarea,
+  .mobile-search-text,
+  .page-input,
+  .mobile-font-row input[type="number"],
+  .tree-container input[type="text"],
+  .folder-buttons button,
+  .overlay-name-input input,
+  .overlay-buttons button,
+}
+
+/* === El body no scrollea; padding global arriba === */
+html, body { height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
+body { padding-top: 50px; } /* o max(env(safe-area-inset-top,0px), 50px) */
+
+/* ===== Modal centrado dentro del overlay ===== */
+.overlay-modal {
+  position: fixed;          /* por encima del contenido del overlay */
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.35);   /* backdrop */
+  z-index: 1100;            /* mayor que .mobile-overlay */
+  padding: max(var(--safe-top), 12px) 12px max(var(--safe-bottom), 12px);
+  box-sizing: border-box;
+}
+
+.overlay-modal-card {
+  width: min(520px, 92vw);
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.18);
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.overlay-modal-title {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+  line-height: 1.25;
+  font-weight: 700;
+}
+
+.overlay-modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  margin-bottom: 10px;
+}
+
+.overlay-modal-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;  /* botones al MISMO renglón, debajo del input */
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.overlay-btn-primary,
+.overlay-btn-secondary {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #ccc;
+  background: #fff;
+  font-weight: 600;
+}
+
+.overlay-btn-primary {
+  border-color: #396cd8;
+  background: #396cd8;
+  color: #fff;
+}
+
+@media (max-width: 360px) {
+  /* En pantallas muy chicas, si no caben 2 columnas, caen a 1 por línea */
+  .overlay-modal-actions {
+    grid-template-columns: 1fr;
+  }
+}
+/* Botón primario destructivo (borrar) */
+.overlay-btn-danger {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #cc3b3b;
+  background: #e04646;
+  color: #fff;
+  font-weight: 600;
+}
+
+.overlay-btn-secondary {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid #ccc;
+  background: #fff;
+  font-weight: 600;
+}
+/* ===== Enlaces en bloques ===== */
+.block-link {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  background: #fff;
+}
+.block-link.has-link {
+  border-color: #0a7;
+  color: #0a7;
+}
+
+.link-chip {
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid #cceee3;
+  background: #eefaf6;
+  color: #0a7;
+  border-radius: 8px;
+  text-decoration: underline;
+}
+.link-chip:hover {
+  filter: brightness(0.98);
+}
