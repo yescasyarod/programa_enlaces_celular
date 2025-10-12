@@ -119,6 +119,64 @@ async function dbMoveBlockToFolderEndByGuids(blockGuid: string, destFolderGuid: 
 /* =========================
    WS + Sync bus
    ========================= */
+   // ==== Cola de reintentos para eventos que llegan fuera de orden (ej. hijo antes que padre) ====
+   const deferredEvents: any[] = [];
+   let deferredTimer: ReturnType<typeof setTimeout> | null = null;
+   
+   function queueDeferred(ev: any) {
+     deferredEvents.push(ev);
+     scheduleDeferredFlush();
+   }
+   
+   function scheduleDeferredFlush(delay = 200) {
+     if (deferredTimer) return;
+     deferredTimer = setTimeout(flushDeferred, delay);
+   }
+   
+   async function flushDeferred() {
+     deferredTimer = null;
+     if (!deferredEvents.length) return;
+   
+     const pending: any[] = [];
+     for (const ev of deferredEvents) {
+       try {
+         const inner = ev.inner_type as string;
+         const p = ev.payload || {};
+   
+         // Necesito que exista el padre antes de crear la carpeta hija
+         if (inner === "create_folder" && p.parent_guid) {
+           const parentId = await folderIdByGuid(p.parent_guid);
+           if (parentId == null) { pending.push(ev); continue; }
+         }
+   
+         // Necesito que exista la carpeta antes de poder crear/editar el bloque ahí
+         if ((inner === "edit_block" || inner === "create_block") && p.folder_guid) {
+           const fid = await folderIdByGuid(p.folder_guid);
+           if (fid == null) { pending.push(ev); continue; }
+         }
+   
+         // Para mover a otra carpeta también debo conocer el destino
+         if ((inner === "move_block_to_folder" || (inner === "move_block" && p.new_folder_guid))) {
+           const fid = await folderIdByGuid(p.new_folder_guid);
+           if (p.new_folder_guid && fid == null) { pending.push(ev); continue; }
+         }
+   
+         if (inner === "move_folder" && p.new_parent_guid) {
+           const pid = await folderIdByGuid(p.new_parent_guid);
+           if (pid == null) { pending.push(ev); continue; }
+         }
+   
+         // Reprocesa con el mismo aplicador
+         await handleIncomingEvent(ev);
+       } catch {
+         pending.push(ev);
+       }
+     }
+     deferredEvents.length = 0;
+     deferredEvents.push(...pending);
+     if (pending.length) scheduleDeferredFlush(400); // backoff suave
+   }
+   
 let ws: WebSocket | null = null;
 const WS_URL = "ws://192.168.1.103:9011";
 const DEVICE_ID_KEY = "device_id_linked";
@@ -222,9 +280,147 @@ async function sendHello(socket: WebSocket) {
   const since_event_id = getLastEventId();
   await socket.send(JSON.stringify({ type: "hello", device_id, since_event_id }));
 }
+async function removeLocalEmptyPlaceholderIfAny(fid: number) {
+  const d = await getDb();
+  // Placeholder típico: fila vacía (texto en blanco) en esa carpeta y sin contenido
+  // (si tus placeholders siempre tienen guid, podés quitar la condición del guid)
+  const rows = await d.select<{ id: number; position: number }[]>(
+    `SELECT id, position
+       FROM blocks
+      WHERE folder_id=? AND deleted=0
+        AND TRIM(IFNULL(text,''))='' 
+      ORDER BY position ASC
+      LIMIT 1`,
+    [fid]
+  );
+  if (!rows.length) return;
+  const { id: phId, position: phPos } = rows[0];
+
+  await d.execute("UPDATE blocks SET deleted=1, updated_at=? WHERE id=?", [new Date().toISOString(), phId]);
+  await d.execute(
+    "UPDATE blocks SET position=position-1 WHERE folder_id=? AND position>? AND deleted=0",
+    [fid, phPos]
+  );
+}
+async function handleIncomingEvent(msg: any) {
+  const inner = msg.inner_type as string;
+  const p = msg.payload || {};
+  const ts = msg.ts as string | undefined;
+
+  try {
+    if (inner === "edit_block") {
+      const b = await blockByGuid(p.block_guid);
+      if (b) {
+        const last = lastLocalEditAt[b.id] ?? 0;
+        if (Date.now() - last >= PROTECT_LOCAL_MS) {
+          await dbEditBlock(b.id, p.text ?? "");
+        }
+      } else {
+        // crear el bloque donde diga el servidor (no en raíz)
+        if (p.folder_guid) {
+          const fid = await folderIdByGuid(p.folder_guid);
+          if (fid == null) { queueDeferred(msg); return; }
+
+          // ✨ evita el “vacío al inicio” si tenías un placeholder local
+          await removeLocalEmptyPlaceholderIfAny(fid);
+          await dbCreateBlock(fid, p.text ?? "", null, p.block_guid);
+        } else {
+          // fallback poco probable: sin folder_guid → usar root
+          const fid = await folderIdByGuid((await getRoot()).guid);
+          if (fid != null) {
+            await removeLocalEmptyPlaceholderIfAny(fid);
+            await dbCreateBlock(fid, p.text ?? "", null, p.block_guid);
+          }
+        }
+      }
+
+    } else if (inner === "create_block") {
+      const fid = p.folder_guid
+        ? await folderIdByGuid(p.folder_guid)
+        : await folderIdByGuid((await getRoot()).guid);
+
+      if (p.folder_guid && (fid == null)) { queueDeferred(msg); return; }
+      if (fid == null) return;
+
+      const isSentinel = !((p.text ?? "").trim());
+      const normLink = (((p.url ?? p.link) ?? "") as string).trim();
+      const linkArg = normLink || null;
+
+      if (isSentinel) {
+        // Solo crear centinela si no hay ya vacío al final
+        const d = await getDb();
+        const tail = await d.select<{ id: number; text: string }[]>(
+          "SELECT id, text FROM blocks WHERE folder_id=? AND deleted=0 ORDER BY position DESC LIMIT 1",
+          [fid]
+        );
+        const alreadyEmptyAtEnd = tail.length > 0 && (tail[0].text ?? "").trim() === "";
+        if (!alreadyEmptyAtEnd) {
+          await dbCreateBlock(fid, "", null, p.block_guid, null);
+        }
+      } else {
+        // ✨ si viene un bloque con texto, primero limpia placeholder vacío
+        await removeLocalEmptyPlaceholderIfAny(fid);
+        await dbCreateBlock(fid, p.text ?? "", null, p.block_guid, linkArg);
+      }
+
+    } else if (inner === "delete_block") {
+      const b = await blockByGuid(p.block_guid);
+      if (b) await dbDeleteBlock(b.id);
+
+    } else if (inner === "move_block") {
+      const b = await blockByGuid(p.block_guid);
+      if (b && p.new_position != null) {
+        await dbMoveBlock(b.id, Number(p.new_position));
+      }
+      if (p.new_folder_guid) {
+        const fid = await folderIdByGuid(p.new_folder_guid);
+        if (fid == null) { queueDeferred(msg); return; }
+        await dbMoveBlockToFolderEndByGuids(p.block_guid, p.new_folder_guid);
+      }
+
+    } else if (inner === "move_block_to_folder") {
+      const fid = await folderIdByGuid(p.new_folder_guid);
+      if (p.new_folder_guid && fid == null) { queueDeferred(msg); return; }
+      await dbMoveBlockToFolderEndByGuids(p.block_guid, p.new_folder_guid);
+
+    } else if (inner === "create_folder") {
+      const exists = await folderIdByGuid(p.folder_guid);
+      if (exists == null) {
+        await createFolderByGuids(p.parent_guid ?? null, p.folder_guid, p.name, ts);
+      }
+    } else if (inner === "rename_folder") {
+      await renameFolderByGuid(p.folder_guid, p.name);
+
+    } else if (inner === "delete_folder") {
+      await deleteFolderByGuid(p.folder_guid);
+
+    } else if (inner === "move_folder") {
+      // si el destino no existe localmente, trata como mover a raíz
+      const pid = p.new_parent_guid ? await folderIdByGuid(p.new_parent_guid) : null;
+      const dstGuid = pid == null ? null : p.new_parent_guid;
+      await moveFolderByGuids(p.folder_guid, dstGuid);
+    } else if (inner === "set_block_link") {
+      const b = await blockByGuid(p.block_guid);
+      if (b) {
+        const d = await getDb();
+        const val = ((p.url ?? p.link) ?? "").trim();
+        // ⚠️ corregido: usamos la columna local 'link_url'
+        await d.execute(
+          "UPDATE blocks SET link_url=?, updated_at=? WHERE id=?",
+          [ val || null, new Date().toISOString(), b.id ]
+        );
+      }
+    }
+  } catch (e) {
+    console.error("[WS] handleIncomingEvent error:", e, inner, p);
+  }
+
+  emitSync();
+}
 
 async function ensureWs(): Promise<WebSocket | null> {
   if (ws) return ws;
+
   try {
     ws = await WebSocket.connect(WS_URL);
 
@@ -233,10 +429,12 @@ async function ensureWs(): Promise<WebSocket | null> {
     stopAppPing();
     startAppPing(ws);
 
+    // listeners de error/cierre (los provee el plugin de Tauri si están disponibles)
     (ws as any).addListenerError?.((e: unknown) => {
       console.error("[WS] error:", e);
       // deja que el close haga el scheduleReconnect
     });
+
     (ws as any).addListenerClose?.((code: number, reason: string) => {
       console.warn("[WS] closed:", code, reason);
       stopAppPing();
@@ -244,129 +442,35 @@ async function ensureWs(): Promise<WebSocket | null> {
       scheduleReconnect(); // ← reconecta solo
     });
 
+    // listener de mensajes
     ws.addListener(async (m: Message) => {
       const text = messageToString(m);
       let msg: any;
       try {
         msg = JSON.parse(text);
       } catch {
-        return;
+        return; // ignora payloads no-JSON
       }
       if (msg?.type !== "event") return;
 
-      // ⤵️ tu lógica existente de aplicación de eventos (SIN cambios)
+      // guarda el último event_id recibido (para hello/since)
       const eid = Number(msg.event_id || 0);
       if (eid > 0) setLastEventId(eid);
 
-      const inner = msg.inner_type as string;
-      const p = msg.payload || {};
-      const ts = msg.ts as string | undefined;
-
-      try {
-        if (inner === "edit_block") {
-          const b = await blockByGuid(p.block_guid);
-          if (b) {
-            const last = lastLocalEditAt[b.id] ?? 0;
-            if (Date.now() - last >= PROTECT_LOCAL_MS) {
-              await dbEditBlock(b.id, p.text ?? "");
-            }
-          } else {
-            const fid = p.folder_guid
-              ? await folderIdByGuid(p.folder_guid)
-              : await folderIdByGuid((await getRoot()).guid);
-            if (fid != null) {
-              await dbCreateBlock(fid, p.text ?? "", null, p.block_guid);
-            }
-          }
-        } else if (inner === "create_block") {
-          const fid = p.folder_guid
-            ? await folderIdByGuid(p.folder_guid)
-            : await folderIdByGuid((await getRoot()).guid);
-        
-          if (fid != null) {
-            const isSentinel = !((p.text ?? "").trim());
-            // normaliza link: preferimos p.url, luego p.link; "" → null
-            const normLink = (((p.url ?? p.link) ?? "") as string).trim();
-            const linkArg = normLink || null;
-        
-            if (isSentinel) {
-              // Sólo crear centinela si no hay uno vacío al final
-              const d = await getDb();
-              const tail = await d.select<{ id: number; text: string }[]>(
-                "SELECT id, text FROM blocks WHERE folder_id=? AND deleted=0 ORDER BY position DESC LIMIT 1",
-                [fid]
-              );
-              const alreadyEmptyAtEnd = tail.length > 0 && (tail[0].text ?? "").trim() === "";
-              if (!alreadyEmptyAtEnd) {
-                // centinela sin enlace
-                await dbCreateBlock(fid, "", null, p.block_guid, null);
-              }
-            } else {
-              // bloque normal: pasa también el enlace si vino
-              await dbCreateBlock(fid, p.text ?? "", null, p.block_guid, linkArg);
-            }
-          }
-        } else if (inner === "delete_block") {
-          const b = await blockByGuid(p.block_guid);
-          if (b) await dbDeleteBlock(b.id);
-        } else if (inner === "move_block") {
-          const b = await blockByGuid(p.block_guid);
-          if (b && p.new_position != null) await dbMoveBlock(b.id, Number(p.new_position));
-          if (p.new_folder_guid) {
-            const blockGuid: string = p.block_guid;
-            const newFolderGuid: string = p.new_folder_guid;
-            if (blockGuid && newFolderGuid) {
-              await dbMoveBlockToFolderEndByGuids(blockGuid, newFolderGuid);
-            }
-          }
-        } else if (
-          inner === "move_block_to_folder" ||
-          (inner === "move_block" && p.new_folder_guid)
-        ) {
-          const blockGuid: string = p.block_guid;
-          const newFolderGuid: string = p.new_folder_guid;
-          if (blockGuid && newFolderGuid) {
-            await dbMoveBlockToFolderEndByGuids(blockGuid, newFolderGuid);
-          }
-        } else if (inner === "create_folder") {
-          const already = await folderIdByGuid(p.folder_guid);
-          if (already == null) {
-            await createFolderByGuids(p.parent_guid ?? null, p.folder_guid, p.name, ts);
-          }
-        } else if (inner === "rename_folder") {
-          await renameFolderByGuid(p.folder_guid, p.name);
-        } else if (inner === "delete_folder") {
-          await deleteFolderByGuid(p.folder_guid);
-        } else if (inner === "move_folder") {
-          await moveFolderByGuids(p.folder_guid, p.new_parent_guid);
-        }
-        else if (inner === "set_block_link") {
-          const b = await blockByGuid(p.block_guid);
-          if (b) {
-            const d = await getDb();
-            const val = ((p.url ?? p.link) ?? "").trim();
-            await d.execute(
-              "UPDATE blocks SET link_url=?, updated_at=? WHERE id=?",
-              [ val || null, new Date().toISOString(), b.id ]
-            );
-          }
-        }        
-      } catch (e) {
-        console.error("[WS] apply error:", e, inner, p);
-      }
-
-      emitSync();
+      // 👉 aplica el evento con el aplicador único (maneja diferidos, placeholders, etc.)
+      await handleIncomingEvent(msg);
     });
 
+    // handshake inicial (resincroniza desde el último event_id)
     await sendHello(ws);
   } catch (e) {
     console.error("WS connect failed:", e);
     ws = null;
     scheduleReconnect(true); // primer intento rápido
   }
+
   return ws;
 }
-
 
 async function wsEmit(obj: any): Promise<void> {
   try {
