@@ -347,14 +347,8 @@ async function handleIncomingEvent(msg: any) {
       const linkArg = normLink || null;
 
       if (isSentinel) {
-        // Solo crear centinela si no hay ya vacío al final
-        const d = await getDb();
-        const tail = await d.select<{ id: number; text: string }[]>(
-          "SELECT id, text FROM blocks WHERE folder_id=? AND deleted=0 ORDER BY position DESC LIMIT 1",
-          [fid]
-        );
-        const alreadyEmptyAtEnd = tail.length > 0 && (tail[0].text ?? "").trim() === "";
-        if (!alreadyEmptyAtEnd) {
+        const exists = await blockByGuid(p.block_guid);
+        if (!exists) {
           await dbCreateBlock(fid, "", null, p.block_guid, null);
         }
       } else {
