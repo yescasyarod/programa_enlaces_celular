@@ -468,6 +468,7 @@ async function ensureWs(): Promise<WebSocket | null> {
 
 async function wsEmit(obj: any): Promise<void> {
   try {
+    if (!navigator.onLine) return;
     const socket = await ensureWs();
     if (!socket) {
       console.warn("WS not connected; dropped:", obj?.type ?? obj);
@@ -478,6 +479,24 @@ async function wsEmit(obj: any): Promise<void> {
     console.error("WS send failed:", e, "payload:", obj?.type ?? obj);
     ws = null;
   }
+}
+
+/* =========================
+   Hook: estado de red
+   ========================= */
+function useOnlineStatus() {
+  const [online, setOnline] = useState<boolean>(navigator.onLine);
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
+  return online;
 }
 
 /* =========================
@@ -1913,6 +1932,7 @@ function RightPanel({
    App
    ========================= */
 function App() {
+  const online = useOnlineStatus();
   const [selectedFolder, setSelectedFolder] = useState<{ id: number | null; name: string; guid?: string }>({
     id: null,
     name: "categorias",
@@ -1929,6 +1949,16 @@ function App() {
   const [showMove, setShowMove] = useState(false);
 
   const blockRef = useRef<BlockColumnHandle>(null);
+
+  useEffect(() => {
+        if (!online) return;
+        void (async () => {
+          try {
+            const socket = await ensureWs();
+            if (socket) await sendHello(socket);
+          } catch {}
+        })();
+      }, [online]);
 
   // 🔒 Anti “salto” por foco en iOS / webviews:
   useEffect(() => {
@@ -1970,7 +2000,7 @@ function App() {
   // ✅ Inicio: intentar restaurar última carpeta usada si existe
   useEffect(() => {
     (async () => {
-      await ensureWs();
+      void ensureWs();
       const r = await getRoot();
 
       const lastGuid = localStorage.getItem(LAST_FOLDER_GUID_KEY);
